@@ -23,6 +23,7 @@ import pandas as pd
 import scipy.io
 import torch
 from omegaconf import DictConfig
+from scipy.sparse import linalg as sp_linalg
 from torch_geometric.data import Data, InMemoryDataset, extract_zip
 from torch_geometric.io import fs
 from torch_geometric.utils import to_undirected
@@ -339,7 +340,92 @@ class A123CortexMDataset(InMemoryDataset):
         # attach metadata
         data.session_id = int(sample.get("session_id", -1))
         data.layer = int(sample.get("layer", -1))
+
+        # Compute Hodge L1 eigenvalues if hodge_k > 0
+        hodge_l1 = self._compute_hodge_l1_eigenvalues(
+            corr, threshold=threshold, k=self.hodge_k
+        )
+        if hodge_l1 is not None:
+            data.hodge_l1 = hodge_l1
+
         return data
+
+    def _compute_hodge_l1_eigenvalues(
+        self, corr: np.ndarray, threshold: float = 0.2, k: int = 6
+    ) -> torch.Tensor:
+        """Compute k smallest Hodge L1 eigenvalues from correlation matrix.
+
+        Hodge L1 is the Laplacian of the 1-skeleton (edge graph) of a clique
+        complex constructed from the thresholded correlation matrix. This
+        captures higher-order connectivity structure.
+
+        Parameters
+        ----------
+        corr : np.ndarray
+            Correlation matrix (n x n).
+        threshold : float, optional
+            Threshold for binarizing correlation to adjacency. Defaults to 0.2.
+        k : int, optional
+            Number of smallest eigenvalues to compute. Defaults to 6.
+
+        Returns
+        -------
+        torch.Tensor
+            Tensor of shape (min(k, n_edges),) containing k smallest eigenvalues,
+            or None if the graph is too small or empty.
+        """
+        if k <= 0 or corr.size == 0:
+            return None
+
+        n = corr.shape[0]
+        # Build adjacency from thresholded correlation
+        adj = (corr >= threshold).astype(int)
+        np.fill_diagonal(adj, 0)  # Remove self-loops
+
+        # Count edges (triangles would be 1-skeleton of 2-cliques)
+        # For simplicity, we compute the Laplacian of the edge graph directly
+        # Edge graph: nodes are edges, two nodes connected if they share a vertex (form triangle)
+
+        # Get edge list
+        rows, cols = np.where(np.triu(adj, k=1))
+        if len(rows) == 0:
+            return None  # No edges
+
+        num_edges = len(rows)
+        # Compute incidence matrix (n_edges x n_nodes)
+        incidence = np.zeros((num_edges, n), dtype=int)
+        for i, (r, c) in enumerate(zip(rows, cols, strict=True)):
+            incidence[i, r] = 1
+            incidence[i, c] = 1
+
+        # Hodge L1 = incidence.T @ incidence (upper adjacency of clique complex)
+        # This gives the number of common neighbors (triangles) for each edge
+        hodge_adj = incidence.T @ incidence - np.diag(
+            np.diag(incidence.T @ incidence)
+        )
+        hodge_degree = hodge_adj.sum(axis=1)
+        hodge_laplacian = np.diag(hodge_degree) - hodge_adj
+
+        # Compute k smallest eigenvalues
+        try:
+            # Use sparse eigenvalue solver if available
+            k_eigs = min(k, hodge_laplacian.shape[0] - 2)
+            if k_eigs <= 0:
+                return None
+
+            eigenvalues, _ = sp_linalg.eigsh(
+                hodge_laplacian, k=k_eigs, which="SM", maxiter=1000
+            )
+            eigenvalues = np.sort(eigenvalues)[:k_eigs]
+            return torch.tensor(eigenvalues, dtype=torch.float32)
+        except Exception:
+            # Fallback if sparse solver fails
+            try:
+                eigenvalues = np.linalg.eigvalsh(hodge_laplacian)
+                eigenvalues = np.sort(eigenvalues)[:k]
+                return torch.tensor(eigenvalues, dtype=torch.float32)
+            except Exception:
+                return None
 
     def process(self) -> None:
         """Generate raw files into collated PyG dataset and save to disk.
