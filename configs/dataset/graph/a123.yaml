@@ -34,7 +34,7 @@ parameters:
   monitor_metric: accuracy
   task_level: graph
   data_name: a123_cortex_m
-  hodge_k: 10
+  hodge_k: 10  # Number of smallest Hodge L1 eigenvalues to compute per graph. Used in models that leverage topology.
   min_neurons: 3
   corr_threshold: 0.2
 
